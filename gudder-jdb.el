@@ -1,4 +1,3 @@
-(add-to-list 'load-path ".")
 (require 'cc-mode)
 (require 'array)
 (require 'gudder)
