@@ -1,46 +1,143 @@
-(require 'cc-mode)
+(require 'cc-mode) ;for java-mode stuff
 (require 'array)
 (require 'gudder)
 
-(defconst jdb-prompt-regex "\n[^=]+\\[[[:digit:]]+\\] "
-  "Regex to match the jdb prompt.")
+(defconst gudder:jdb-prompt-regexp "^> \\|^[^ ]+\\[[0-9]+\\] "
+  "Regexp for detecting the jdb prompt")
 
-(defvar *jdb-breakpoints* '()
-  "Stores all currently active breakpoints for the jdb session.
-Breakpoints are stored in the following format:
-`(filepath . line-number)'")
+(defconst gudder:jdb-step-complete-regexp "Breakpoint hit:\\|Step completed:"
+  "Regexp for detecting that a step or continut has been completed.")
 
-(defvar *overlays-drawn* nil
-  "A flag to say whether or not the debug overlays have been drawn.")
-
-(gudder-toggle-breakpoint 'jdb 'java-mode *jdb-breakpoints*)
-
-(defun gudder-jdb ()
-  (interactive)
-  (gudder-breakpoint-clearer 'jdb *jdb-breakpoints*)
-  (gudder-breakpoint-listener 'jdb *jdb-breakpoints* jdb-breakpoint-output-parser)
-  (gudder-bind-keys 'java-mode)
-  (add-hook 'comint-output-filter-functions #'jdb-overlay-listener-filter-function)
-  (call-interactively #'cd)
-  (when (running-gud)
-    (kill-process (running-gud)))
+;;;###autoload
+(defun gudder:jdb (directory command-line)
+  "Call `jdb' the Gudder way.
+-sourcepath and -classpath should have white space between them and their path
+lists (: delimited) just like normal."
+  (interactive
+   (list (expand-file-name (read-directory-name "Run debugger from: ")) ;directory
+         nil))
+  (setq command-line
+        (gud-query-cmdline 'jdb
+                           (concat "-launch -sourcepath " directory " -classpath " directory " ")))
+  (gudder:bind-keys java-mode)
+  (gudder:breakpoint-setup jdb gudder:jdb-breakpoint-handler)
+  (gudder:debug-info-setup jdb gudder:jdb-overlay-subhandler
+                           gudder:jdb-step-complete-regexp)
   (save-window-excursion
-    (call-interactively #'jdb))
-  ;; clear debug values
-  (dolist (buffer (buffer-list))
-    (gudder-clear-debug-values buffer))
-  ;; reset breakpoints
-  (let ((breakpoints *jdb-breakpoints*))
-    (setq *jdb-breakpoints* '())
-    (dolist (breakpoint breakpoints)
-      (let ((filename (file-name-nondirectory (car breakpoint)))
-            (line-number (cdr breakpoint)))
-        (sync-process-send-string (running-gud) (concat "stop at "
-                                                        (gud-find-class filename line-number) ":"
-                                                        (number-to-string line-number) "\n")
-                                  jdb-prompt-regex 1)))))
+    ;; kill existing process
+    (let ((gud (gudder:running-gud)))
+      (when gud (kill-buffer (process-buffer gud))))
+    ;; start gudebugger
+    (with-current-buffer (find-file directory)
+    (jdb (replace-regexp-in-string "-sourcepath[[:space:]]+" "-sourcepath"
+                                   (replace-regexp-in-string "-classpath[[:space:]]+" "-classpath"
+                                                             command-line)))
+    )))
+;; Reusing default handlers. Trigger can be testing like
+;; (jdb-invalidate-breakpoints 'update)
+(def-gdb-auto-update-trigger
+  jdb-invalidate-breakpoints "clear"
+  'gdb-breakpoints-list-handler
+  '(start update))
+(def-gdb-auto-update-trigger
+  jdb-invalidate-threads "threads"
+  'gdb-thread-list-handler
+  '(start update update-threads))
+(def-gdb-auto-update-trigger
+  jdb-invalidate-frames "where"
+  'gdb-stack-list-frames-handler
+  '(start update))
+(def-gdb-auto-update-trigger
+  jdb-invalidate-locals "locals"
+  'gdb-locals-handler
+  '(start update))
 
-(defun jdb-find-function (filename function-name)
+(defun gudder:jdb-breakpoint-handler (output-str)
+  "See `gudder:breakpoint-setup'."
+  (mapcar
+   (lambda (line)
+     (if (or (s-matches-p "\\(Deferring\s\\|Set\s\\)breakpoint" output-str)
+             (s-matches-p "\\(Removed:\sbreakpoint\\|Not found: breakpoint\\)" output-str))
+         ;; add or remove breakpoint
+         (cons
+          (if (s-matches-p "\\(Deferring\s\\|Set\s\\)breakpoint" line)
+              'add
+            'remove)
+          (let ((breakpoint-str (car (last (s-split "\s" line :omit-nulls)))))
+            (when (s-matches-p ":" breakpoint-str)
+              (let* ((breakpoint-separated (s-split ":" breakpoint-str))
+                     (filepath (defpipeline path breakpoint-separated
+                                 (car path)
+                                 (replace-regexp-in-string "\\." "/" path)
+                                 (gud-jdb-find-source-using-classpath path)
+                                 (expand-file-name path)))
+                     (line-number (string-to-number
+                                   (replace-regexp-in-string
+                                    "\\." "" (cadr breakpoint-separated)))))
+                (list filepath line-number)))))
+       (list nil nil nil)))
+     (s-split "\n" output-str :omit-nulls)))
+
+(defun gudder:jdb-overlay-subhandler (filepath line-number)
+  "See `gudder:debug-info-setup'."
+  (with-current-buffer (find-file filepath)
+    (goto-char (point-min))
+    (forward-line (- line-number 1))
+    (let ((header-line (save-excursion
+                         (cl-loop
+                          do (progn
+                               (forward-line -1)
+                               (let ((start (progn (back-to-indentation) (point)))
+                                     (end (progn (goto-last-non-comment) (point))))
+                                 (cond
+                                  ((progn (beginning-of-line)
+                                          (looking-at "^\s*\\(public\\|private\\|protected\\)?\s*\\(static\\)?\s*[a-zA-Z0-9_]+\s+[a-zA-Z0-9_]+\s*("))
+                                   (cl-return (+ (current-line) 1)))
+                                  ((gudder:debug-overlays (current-buffer) start (+ 1 end))
+                                   (cl-return nil))
+                                  ((= (current-line) 0)
+                                   (cl-return nil))))))))
+          (rest-of-function-call-lines
+           (save-excursion (cl-loop
+                            while (not (looking-at ".*[;{}].*"))
+                            do (forward-line 1)
+                            collect (+ (current-line) 1)))))
+      (mapcar
+       (lambda (line)
+         (goto-char (point-min))
+         (forward-line (- line 1))
+         (let* ((start (save-excursion (back-to-indentation) (point)))
+                (end (save-excursion (goto-last-non-comment) (point)))
+                (idents (defpipeline idents
+                          (buffer-substring-no-properties start end)
+                          (without-embeded-strings idents)
+                          (s-replace-regexp "[.]?[^[:space:].]+(\\|[()!%^&*|,=+;<>?:/{}-]\\|\\]\\|\\[" " "
+                                            idents) ;it is important that the - is last in the regexp group [...-]
+                          (s-split " " idents :omit-nulls)
+                          (-filter (lambda (ident) ;remove Boolean literals and numbers
+                                     (not (s-matches-p "^[[:digit:].]+$\\|true\\|false" ident)))
+                                   idents)
+                          (mapcar (lambda (ident)
+                                    (cond
+                                     ((or (s-matches-p "\\[[^]]*$" ident)
+                                          (s-matches-p "\\[.*(.*).*\\]" ident))
+                                      (substring ident 0 (s-index-of "[" ident)))
+                                     ((s-matches-p "[(]" ident)
+                                      (defpipeline ident
+                                        (substring ident 0 (s-index-of "(" ident))
+                                        (substring ident 0 (-find-last-index
+                                                            (lambda (char)
+                                                              (char-equal char ?.))
+                                                            (string-to-list ident)))))
+                                     (:else ident)))
+                                  idents)
+                          (-uniq idents)))
+                (debug-values ""))
+           (gudder:clear-debug-values (current-buffer) start (+ 1 end))
+           (cons line (gudder:jdb-idents-values idents))))
+       (-non-nil (append (list line-number header-line) rest-of-function-call-lines))))))
+
+(defun gudder:jdb-find-function (filename function-name)
   "Return the line number where FUNCTION-NAME appears in FILENAME.
 Return nil if the file or function doesn't exist."
   (when (file-exists-p filename)
@@ -50,195 +147,57 @@ Return nil if the file or function doesn't exist."
         (while (< (point) (point-max))
           (when (looking-at (concat "^\s*\\(public\\|private\\|protected\\)?\s*\\(static\\)?\s*[a-zA-Z0-9_]+\s+"
                                     function-name "\s*("))
-            (setq line-number (1+ (current-line))))
+            (setq line-number (+ (current-line) 1)))
           (forward-line))
         line-number))))
 
-(defun jdb-breakpoint-output-parser (output-str)
-  (if (or (s-matches-p "\\(^Deferring\s\\|Set\s\\)breakpoint" output-str)
-          (s-matches-p "\\(^Removed:\sbreakpoint\\|^Not found: breakpoint\\)" output-str))
-      ;; add or remove breakpoint
-      (list
-       (append
-        (list (if (s-matches-p "\\(^Deferring\s\\|Set\s\\)breakpoint" output-str)
-                  'add
-                'remove))
-        (let ((breakpoint-str (car (last (s-split "\s" (car (s-split "\n" output-str t)))))))
-          (if (s-matches-p ":" breakpoint-str)
-              ;; line number breakpoint
-              (let* ((breakpoint-separated (s-split ":" breakpoint-str))
-                     (filepath (expand-file-name (gudder-find-source (replace-regexp-in-string "\\." "/" (car breakpoint-separated))
-                                                   ".java"
-                                                   gud-jdb-sourcepath)))
-                     (line-number (string-to-number (replace-regexp-in-string "\\." "" (cadr breakpoint-separated)))))
-                (list filepath line-number))
-            ;; function breakpoint
-            (let* ((breakpoint-separated (s-split "\\." breakpoint-str t))
-                   (filepath (gudder-find-source (-reduce (lambda (path dirname)
-                                                            (concat (file-name-as-directory path)  dirname))
-                                                          (without-last breakpoint-separated))
-                                                 ".java"
-                                                 gud-jdb-sourcepath))
-                   (line-number (jdb-find-function filepath
-                                                   (car (last breakpoint-separated)))))
-              (list filepath line-number))))))
-    '(nil nil nil)))
-
-(cl-defun gud-find-class (f _line &optional (paths (or gud-jdb-sourcepath '("."))))
-  "Return the Java fully qualified classname of source file F.
-This function uses `gud-jdb-sourcepath' to find F."
-  (defun gud-find-class-helper (f path partial-path)
-    (if (or (null path)
-            (string= f (file-name-nondirectory partial-path)))
-        (s-replace-regexp "/\\|\\\\" "." (file-name-sans-extension partial-path)) ;; convert filepath to java classpath
-      (when (file-directory-p path)
-        (let* ((files (cddr (directory-files path :full))))
-          (eval (cons 'or (mapcar (lambda (file)
-                                    `(gud-find-class-helper
-                                      ,f ,file
-                                      ,(concat (if (string= partial-path "")
-                                                   ""
-                                                 (file-name-as-directory partial-path))
-                                               (file-name-nondirectory file))))
-                                  files)))))))
-  (eval (cons 'or (mapcar (lambda (path)
-                            `(gud-find-class-helper ,(file-name-nondirectory f) ,path ""))
-                          (mapcar #'file-name-as-directory paths)))))
-
-(defun jdb-overlay-listener-filter-function (output-str)
-  (run-with-timer .0005 nil #'jdb-overlay-listener output-str)
-  output-str)
-
-(defun jdb-overlay-listener (output-str)
-  (when (and output-str (s-index-of ", line=" output-str))
-    (let ((filepath (buffer-file-name (marker-buffer gud-overlay-arrow-position)))
-          (line-number (with-current-buffer (marker-buffer gud-overlay-arrow-position)
-            (goto-char gud-overlay-arrow-position)
-            (+ 1 (current-line))))
-          (header-line (save-excursion
-            (cl-loop (forward-line -1)
-              (let ((start (progn (back-to-indentation) (point)))
-                    (end (progn (goto-last-non-comment) (point))))
-                (cond
-                 ((progn (beginning-of-line)
-                         (looking-at "^\s*\\(public\\|private\\|protected\\)?\s*\\(static\\)?\s*[a-zA-Z0-9_]+\s+[a-zA-Z0-9_]+\s*("))
-                  (cl-return (+ 1 (current-line))))
-                 ((gudder-debug-overlays (current-buffer) start (+ 1 end))
-                  (cl-return nil))
-                 ((= (current-line) 0)
-                  (cl-return nil)))))))
-          (rest-of-function-call-lines (save-excursion
-            (cl-loop while (not (looking-at ".*;.*"))
-                     do (forward-line 1)
-                     collect (1+ (current-line))))))
-      (save-window-excursion
-        (with-current-buffer (find-file filepath)
-          (save-excursion
-            (dolist (line (-non-nil (append (list line-number header-line) rest-of-function-call-lines)))
-              (goto-char (point-min))
-              (forward-line (1- line))
-              (let* ((start (save-excursion (back-to-indentation) (point)))
-                     (end (save-excursion (goto-last-non-comment) (point)))
-                     (idents (defpipeline idents
-                       (buffer-substring-no-properties start end)
-                       (s-split "" idents :omit-nulls)
-                       (gudder-jdb-group-idents idents)
-                       (s-join "" idents)
-                       (without-embeded-strings idents)
-                       (s-split " " idents :omit-nulls)
-                       (-filter (lambda (ident) ;remove Boolean literals and numbers
-                                  (not (s-matches-p "^[[:digit:].]$\\valuetrue\\valuefalse" ident)))
-                                idents)
-                       (mapcar (lambda (ident)
-                                 (cond
-                                  ((or (s-matches-p "\\[[^]]*$" ident)
-                                       (s-matches-p "\\[.*(.*).*\\]" ident))
-                                   (substring ident 0 (s-index-of "[" ident)))
-                                  ((s-matches-p "[(]" ident)
-                                   (defpipeline * ident
-                                     (substring * 0 (s-index-of "(" *))
-                                     (substring * 0 (-find-last-index (lambda (char)
-                                                                        (char-equal char ?.))
-                                                                      (string-to-list *)))))
-                                  (:else ident)))
-                               idents)
-                       (-uniq idents)))
-                     (debug-values ""))
-                (gudder-clear-debug-values (current-buffer) start (+ 1 end))
-                (dolist (pair (gudder-jdb-idents-values idents) debug-values)
-                  (when pair
-                    (setq debug-values (concat debug-values (car pair) ": " (if (<= (length (cadr pair)) gudder-max-debug-value-length)
-                                                                                (cadr pair)
-                                                                              (concat (substring (cadr pair) 0 gudder-max-debug-value-length) "...")) "  "))))
-                (when (not (string= debug-values ""))
-                  (add-debug-info-here (concat " " debug-values " "))))))))))
-  (setq *overlays-drawn* t))
-
-(cl-defun gudder-jdb-group-idents (charlst &optional (in-array 0))
-  (cond
-   ((null charlst) nil)
-   ((or (and (= 0 in-array)
-             (s-matches-p "[[:alpha:][:digit:].\"']" (car charlst)))
-        (and (/= 0 in-array)
-             (s-matches-p "[[:alpha:][:digit:].\"'-/+*%^&value<>?!@~\s]" (car charlst))))
-    (append (list (if (s-matches-p "\s" (car charlst))
-                      ""
-                    (car charlst)))
-            (gudder-jdb-group-idents (cdr charlst) in-array)))
-   ((string= "[" (car charlst))
-    (append (list (car charlst))
-            (gudder-jdb-group-idents (cdr charlst) (1+ in-array))))
-   ((string= "]" (car charlst))
-    (append (list (car charlst))
-            (gudder-jdb-group-idents (cdr charlst) (1- in-array))))
-   ((s-matches-p "(" (car charlst))
-    (append (list (car charlst))
-            '(" ")
-            (gudder-jdb-group-idents (cdr charlst) in-array)))
-   (:else
-    (append '(" ")
-            (gudder-jdb-group-idents (cdr charlst) in-array)))))
-
-(defun gudder-jdb-idents-values (idents)
-  (if (not (running-gud))
-      nil
+(defun gudder:jdb-idents-values (idents)
+  "Return a list of list-pairs like so
+'((ident1 value1) (ident2 value2) (ident3 value3))'"
+  (when (gudder:running-gud)
     (-non-nil
-     (mapcar (lambda (ident)
-              (let ((value (jdb-value ident)))
-                (cond
-                 ((s-matches-p "null" value) nil) ;null value
-                 ((s-matches-p "\\[[[:digit:]]+\\]" value) ;array
-                  (let ((length (string-to-number (jdb-value (concat ident ".length")))))
-                    (list ident (gudder-jdb-array-value ident length))))
-                 (:else                 ;some primitive or has a toString()
-                  (list ident value)))))
-             idents))))
+     (mapcar
+      (lambda (ident)
+        (let ((value (or (gudder:jdb-value ident)
+                         (gudder:jdb-value (concat "this." ident)))))
+          (cond
+           ((null value) nil)
+           ((s-matches-p "null" value) nil) ;null value
+           ((s-matches-p "\\[[[:digit:]]+\\]" value) ;array
+            (let ((length (string-to-number
+                           (or (gudder:jdb-value (concat ident ".length"))
+                               "0"))))
+              (list ident (gudder:jdb-array-value ident length))))
+           (:else           ;some primitive or has a toString()
+            (list ident value)))))
+      idents))))
 
-(defun jdb-value (ident)
-  (defpipeline value ident
-    (sync-process-send-string (running-gud)
-                              (concat "print " value "\n") jdb-prompt-regex 1)
-    (s-split "\n" value)
-    (without-last value)
-    (last value)
-    (car value)
-    (if (and value (s-index-of (concat ident " = ") value))
-        (substring value (+ (s-index-of (concat ident " = ") value)
-                            (length ident)
-                            3))
-      "null")))
+(defun gudder:jdb-value (ident)
+  (let ((gud (gudder:running-gud)))
+    (when gud
+      (let ((output (sync-process-send-string gud
+                                             (concat "print " ident "\n") gudder:jdb-prompt-regexp)))
+        (when output
+            (let* ((start-index (s-index-of (concat ident " = ") output))
+                   (value (when start-index
+                            (substring output (+ (or start-index 0) (length ident) 3)
+                                       (or (s-next-index "\n" output start-index) (length output))))))
+              (if (and value (string= value "null"))
+                  nil
+                value)))))))
 
-(defun gudder-jdb-array-value (name length)
-  (defpipeline * length
+(defun gudder:jdb-array-value (name length)
+  (defpipeline values length
     (let ((idents '()))
-      (dotimes (i * idents)
+      (dotimes (i values idents)
         (push (concat name "[" (number-to-string i) "]") idents)))
-    (reverse *)
-    (gudder-jdb-idents-values *)
+    (reverse values)
+    (gudder:jdb-idents-values values)
     (mapcar (lambda (pair)
-              (cadr pair)) *)
-    (s-join ", " *)
-    (concat "{" * "}")))
+              (cadr pair))
+            values)
+    (s-join ", " values)
+    (concat "{" values "}")))
 
 (provide 'gudder-jdb)
 ;;; gudder-jdb.el ends here
