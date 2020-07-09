@@ -8,7 +8,6 @@
 (defconst gudder:jdb-step-complete-regexp "Breakpoint hit:\\|Step completed:"
   "Regexp for detecting that a step or continut has been completed.")
 
-;;;###autoload
 (defun gudder:jdb (directory command-line)
   "Call `jdb' the Gudder way.
 -sourcepath and -classpath should have white space between them and their path
@@ -31,8 +30,8 @@ lists (: delimited) just like normal."
     (with-current-buffer (find-file directory)
     (jdb (replace-regexp-in-string "-sourcepath[[:space:]]+" "-sourcepath"
                                    (replace-regexp-in-string "-classpath[[:space:]]+" "-classpath"
-                                                             command-line)))
-    )))
+                                                             command-line))))))
+
 ;; Reusing default handlers. Trigger can be testing like
 ;; (jdb-invalidate-breakpoints 'update)
 (def-gdb-auto-update-trigger
@@ -155,7 +154,6 @@ Return nil if the file or function doesn't exist."
   "Return a list of list-pairs like so
 '((ident1 value1) (ident2 value2) (ident3 value3))'"
   (when (gudder:running-gud)
-    (-non-nil
      (mapcar
       (lambda (ident)
         (let ((value (or (gudder:jdb-value ident)
@@ -169,8 +167,10 @@ Return nil if the file or function doesn't exist."
                                "0"))))
               (list ident (gudder:jdb-array-value ident length))))
            (:else           ;some primitive or has a toString()
-            (list ident value)))))
-      idents))))
+            (list ident (s-replace-all '(("\"[" . "[") ("]\"" . "]")
+                                         ("\"{" . "{") ("}\"" . "}"))
+                                        value))))))
+      idents)))
 
 (defun gudder:jdb-value (ident)
   (let ((gud (gudder:running-gud)))
@@ -197,6 +197,7 @@ Return nil if the file or function doesn't exist."
               (cadr pair))
             values)
     (s-join ", " values)
+    (s-replace "\"" "" values)
     (concat "{" values "}")))
 
 (provide 'gudder-jdb)
